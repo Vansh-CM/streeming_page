@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Live Bidding Stream PoC</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #1a202c; color: #e2e8f0; }
+        .video-container { background-color: #2d3748; border-radius: 0.5rem; overflow: hidden; }
+        video { width: 100%; height: auto; display: block; }
+        .btn {
+            padding: 0.75rem 1.5rem;
+            border-radius: 0.375rem;
+            font-weight: 600;
+            transition: background-color 0.2s ease-in-out;
+            cursor: pointer;
+        }
+        .btn-primary { background-color: #4299e1; color: white; }
+        .btn-primary:hover { background-color: #3182ce; }
+        .btn-secondary { background-color: #4a5568; color: white; }
+        .btn-secondary:hover { background-color: #2d3748; }
+        .btn-danger { background-color: #e53e3e; color: white; }
+        .btn-danger:hover { background-color: #c53030; }
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+        }
+        .status-dot.green { background-color: #48bb78; }
+        .status-dot.red { background-color: #f56565; }
+        .status-dot.yellow { background-color: #ecc94b; }
+        .log-box {
+            background-color: #2d3748;
+            border: 1px solid #4a5568;
+            padding: 1rem;
+            border-radius: 0.375rem;
+            max-height: 200px;
+            overflow-y: auto;
+            font-size: 0.875rem;
+            color: #a0aec0;
+        }
+        .log-box p { margin-bottom: 0.5rem; }
+    </style>
+    <script src="https://unpkg.com/react@17/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@17/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="http://localhost:3001/socket.io/socket.io.js"></script>
+</head>
+<body class="flex items-center justify-center min-h-screen">
+    <div id="root" class="w-full max-w-4xl p-4"></div>
+
+    <script type="text/babel" data-presets="react,env">
+        // --- Configuration ---
+        // UPDATED TO EXPLICITLY POINT TO NODE SERVER
+        const SOCKET_SERVER_URL = 'http://localhost:3001';
+        const ROOM_ID = 'bidding-room';
+        const ICE_SERVERS = [
+            { urls: 'stun:stun.l.google.com:19302' } // Example STUN server
+            // For production, add TURN servers here:
+            // {
+            //   urls: 'turn:your-turn-server.com:3478',
+            //   username: 'your-username',
+            //   credential: 'your-password'
+            // }
+        ];
+
+        // --- Utility Functions ---
+        function logMessage(message, setLogs) {
+            console.log(message);
+            // Ensure setLogs is a function before calling
+            if (typeof setLogs === 'function') {
+                setLogs(prevLogs => [...prevLogs, `${new Date().toLocaleTimeString()}: ${message}`]);
+            }
+        }
+
+        // --- React Components ---
+
+        // VideoPlayer Component
+        function VideoPlayer({ stream, isMuted, label }) {
+            const videoRef = React.useRef(null);
+
+            React.useEffect(() => {
+                if (videoRef.current && stream) {
+                    videoRef.current.srcObject = stream;
+                } else if (videoRef.current) {
+                    videoRef.current.srcObject = null; // Clear video if stream is null
+                }
+            }, [stream]);
+
+            return (
+                <div className="video-container mb-4 shadow-lg">
+                    <video ref={videoRef} autoPlay playsInline muted={isMuted}></video>
+                    {label && <p className="text-center text-sm p-2 bg-gray-700">{label}</p>}
+                </div>
+            );
+        }
+
+        // HostPage Component
+        function HostPage({ socket, setLogs }) {
+            const [localStream, setLocalStream] = React.useState(null);
+            const [isStreaming, setIsStreaming] = React.useState(false);
+            const peerConnections = React.useRef({}); // Stores RTCPeerConnection for each participant { participantId: pc }
+
+            // Start streaming
+            const startStreaming = async () => {
+                logMessage('Attempting to start stream...', setLogs);
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                    setLocalStream(stream);
+                    setIsStreaming(true);
+                    socket.emit('host-started-stream', ROOM_ID);
+                    logMessage('Streaming started. Waiting for participants.', setLogs);
+                } catch (error) {
+                    logMessage(`Error starting stream: ${error.message}`, setLogs);
+                    console.error('Error accessing media devices.', error);
+                    setIsStreaming(false); // Ensure state is reset on error
+                }
+            };
+
+            // Stop streaming
+            const stopStreaming = () => {
+                logMessage('Stopping stream...', setLogs);
+                if (localStream) {
+                    localStream.getTracks().forEach(track => track.stop());
+                }
+                setLocalStream(null);
+                setIsStreaming(false);
+                socket.emit('host-stopped-stream', ROOM_ID);
+
+                Object.keys(peerConnections.current).forEach(participantId => {
+                    if (peerConnections.current[participantId]) {
+                        peerConnections.current[participantId].close();
+                    }
+                });
+                peerConnections.current = {};
+                logMessage('Stream stopped and connections closed.', setLogs);
+            };
+
+            React.useEffect(() => {
+                if (!socket) return;
+
+                const handleParticipantWantsToConnect = (participantId) => {
+                    if (!isStreaming || !localStream) { // Check if host is actually streaming
+                        logMessage(`Participant ${participantId} wants to connect, but host is not ready or not streaming.`, setLogs);
+                        // Optionally, notify participant that host is not ready
+                        // socket.emit('host-not-ready', participantId);
+                        return;
+                    }
+                    logMessage(`Participant ${participantId} wants to connect. Creating offer...`, setLogs);
+
+                    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+                    peerConnections.current[participantId] = pc;
+
+                    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+                    pc.onicecandidate = (event) => {
+                        if (event.candidate) {
+                            socket.emit('ice-candidate', { target: participantId, candidate: event.candidate, room: ROOM_ID });
+                        }
+                    };
+                    
+                    pc.oniceconnectionstatechange = () => {
+                        logMessage(`ICE connection state for ${participantId}: ${pc.iceConnectionState}`, setLogs);
+                        if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'closed') {
+                            logMessage(`Connection with ${participantId} failed/closed. Cleaning up.`, setLogs);
+                            if (peerConnections.current[participantId]) {
+                                peerConnections.current[participantId].close();
+                                delete peerConnections.current[participantId];
+                                // Force a re-render if needed to update participant count, though useRef change won't trigger it directly
+                            }
+                        }
+                    };
+
+                    pc.createOffer()
+                        .then(offer => pc.setLocalDescription(offer))
+                        .then(() => {
+                            socket.emit('offer', { target: participantId, offer: pc.localDescription, room: ROOM_ID });
+                            logMessage(`Offer sent to participant ${participantId}.`, setLogs);
+                        })
+                        .catch(e => {
+                            logMessage(`Error creating offer for ${participantId}: ${e.message}`, setLogs);
+                            // Clean up failed connection attempt
+                            if (peerConnections.current[participantId]) {
+                                peerConnections.current[participantId].close();
+                                delete peerConnections.current[participantId];
+                            }
+                        });
+                };
+                socket.on('participant-wants-to-connect', handleParticipantWantsToConnect);
+
+                const handleAnswer = ({ fromId, answer }) => {
+                    logMessage(`Received answer from participant ${fromId}.`, setLogs);
+                    const pc = peerConnections.current[fromId];
+                    if (pc && pc.signalingState === "have-local-offer") { // Check signaling state
+                        pc.setRemoteDescription(new RTCSessionDescription(answer))
+                            .catch(e => logMessage(`Error setting remote description for ${fromId}: ${e.message}`, setLogs));
+                    } else {
+                         logMessage(`No valid peer connection or state for participant ${fromId} to set answer. Current state: ${pc ? pc.signalingState : 'N/A'}`, setLogs);
+                    }
+                };
+                socket.on('answer', handleAnswer);
+
+                const handleIceCandidate = ({ fromId, candidate }) => {
+                    // logMessage(`Received ICE candidate from participant ${fromId}.`, setLogs); // Can be very verbose
+                    const pc = peerConnections.current[fromId];
+                    if (pc && candidate && pc.signalingState !== "closed") { // Check if pc exists and not closed
+                        pc.addIceCandidate(new RTCIceCandidate(candidate))
+                            .catch(e => {
+                                if (pc.signalingState !== "closed") { // Avoid error if already closed
+                                    logMessage(`Error adding ICE candidate from ${fromId}: ${e.message}`, setLogs);
+                                }
+                            });
+                    }
+                };
+                socket.on('ice-candidate', handleIceCandidate);
+
+                const handleParticipantDisconnected = (participantId) => {
+                    logMessage(`Participant ${participantId} disconnected (server signal). Closing connection.`, setLogs);
+                    if (peerConnections.current[participantId]) {
+                        peerConnections.current[participantId].close();
+                        delete peerConnections.current[participantId];
+                        // Force re-render to update participant count if it's displayed via state
+                        // For this PoC, console log is primary feedback.
+                    }
+                };
+                socket.on('participant-disconnected', handleParticipantDisconnected);
+
+                return () => {
+                    socket.off('participant-wants-to-connect', handleParticipantWantsToConnect);
+                    socket.off('answer', handleAnswer);
+                    socket.off('ice-candidate', handleIceCandidate);
+                    socket.off('participant-disconnected', handleParticipantDisconnected);
+                    if (isStreaming) { // Ensure stopStreaming is called if component unmounts while streaming
+                        stopStreaming();
+                    } else { // If not streaming, still clean up any potentially open (but unused) peer connections
+                         Object.keys(peerConnections.current).forEach(id => {
+                            if(peerConnections.current[id]) peerConnections.current[id].close();
+                         });
+                         peerConnections.current = {};
+                    }
+                };
+            }, [socket, localStream, isStreaming, setLogs]); // Added isStreaming and localStream as dependencies
+
+
+            return (
+                <div className="p-6 bg-gray-800 shadow-xl rounded-lg">
+                    <h2 className="text-3xl font-bold mb-6 text-center text-blue-300">Host Panel</h2>
+                    {!isStreaming ? (
+                        <button onClick={startStreaming} className="w-full btn btn-primary mb-4" disabled={isStreaming}>
+                            <span className="status-dot yellow"></span>Start Streaming
+                        </button>
+                    ) : (
+                        <button onClick={stopStreaming} className="w-full btn btn-danger mb-4" disabled={!isStreaming}>
+                            <span className="status-dot red"></span>Stop Streaming
+                        </button>
+                    )}
+                    {localStream && isStreaming && ( // Only show preview if actually streaming
+                        <div>
+                            <h3 className="text-xl font-semibold mb-2 text-gray-300">Your Preview:</h3>
+                            <VideoPlayer stream={localStream} isMuted={true} label="Your Local Stream (Muted for you)" />
+                        </div>
+                    )}
+                    <p className="text-sm text-gray-400 mt-2">
+                        <span className={`status-dot ${isStreaming ? 'green' : 'red'}`}></span>
+                        Status: {isStreaming ? 'Streaming Live' : 'Not Streaming'}
+                    </p>
+                    <p className="text-sm text-gray-400">Connected Participants: {Object.keys(peerConnections.current).length}</p>
+                </div>
+            );
+        }
+
+        // ParticipantPage Component
+        function ParticipantPage({ socket, setLogs }) {
+            const [remoteStream, setRemoteStream] = React.useState(null);
+            const [hostSocketId, setHostSocketId] = React.useState(null);
+            const [isHostStreaming, setIsHostStreaming] = React.useState(false);
+            const [connectionStatus, setConnectionStatus] = React.useState('Waiting for host...'); // More detailed status
+            const peerConnection = React.useRef(null);
+
+            const cleanupPeerConnection = React.useCallback(() => {
+                if (peerConnection.current) {
+                    peerConnection.current.close();
+                    peerConnection.current = null;
+                    logMessage('Previous peer connection closed.', setLogs);
+                }
+                setRemoteStream(null);
+            }, [setLogs]);
+
+
+            const connectToHost = React.useCallback((targetHostId) => {
+                if (!socket || !targetHostId) {
+                    logMessage('Socket or targetHostId missing for connectToHost.', setLogs);
+                    setConnectionStatus('Error: Missing connection details.');
+                    return;
+                }
+                if (peerConnection.current && (peerConnection.current.connectionState === 'connected' || peerConnection.current.connectionState === 'connecting')) {
+                    logMessage(`Already connected or connecting to ${targetHostId}. Current state: ${peerConnection.current.connectionState}`, setLogs);
+                    return;
+                }
+
+                cleanupPeerConnection(); // Clean up any existing connection before starting a new one
+
+                logMessage(`Attempting to connect to host ${targetHostId}...`, setLogs);
+                setConnectionStatus(`Connecting to host ${targetHostId}...`);
+
+                const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+                peerConnection.current = pc;
+
+                pc.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        socket.emit('ice-candidate', { target: targetHostId, candidate: event.candidate, room: ROOM_ID });
+                    }
+                };
+
+                pc.ontrack = (event) => {
+                    logMessage('Remote stream track received.', setLogs);
+                    setConnectionStatus('Stream received!');
+                    if (event.streams && event.streams[0]) {
+                        setRemoteStream(event.streams[0]);
+                    } else {
+                        const newStream = new MediaStream();
+                        event.tracks.forEach(track => newStream.addTrack(track));
+                        setRemoteStream(newStream);
+                    }
+                };
+                
+                pc.oniceconnectionstatechange = () => {
+                    const currentState = pc.iceConnectionState;
+                    logMessage(`ICE connection state with host: ${currentState}`, setLogs);
+                    switch (currentState) {
+                        case 'connected':
+                            setConnectionStatus('Connected to host.');
+                            break;
+                        case 'disconnected':
+                            setConnectionStatus('Disconnected from host. Attempting to re-establish...');
+                            // WebRTC can sometimes self-recover from 'disconnected'
+                            // If it moves to 'failed', then it's a more permanent issue.
+                            // Consider closing and nullifying PC here if it doesn't recover.
+                            // For PoC, we'll let it try. If it fails, host-stopped-stream should clean up.
+                            break;
+                        case 'failed':
+                            setConnectionStatus('Connection failed.');
+                            cleanupPeerConnection();
+                            setIsHostStreaming(false); // Assume host is no longer available
+                            setHostSocketId(null);
+                            break;
+                        case 'closed':
+                            setConnectionStatus('Connection closed.');
+                            // No action needed here if cleanupPeerConnection was called by 'failed' or 'host-stopped-stream'
+                            break;
+                        default:
+                            setConnectionStatus(`Connection status: ${currentState}`);
+                    }
+                };
+                
+                pc.onsignalingstatechange = () => {
+                    logMessage(`Signaling state with host: ${pc.signalingState}`, setLogs);
+                };
+
+                // Notify host that this participant wants to connect
+                // The hostId here is the one received from 'host-started-stream' or 'check-for-host'
+                socket.emit('participant-wants-to-connect', { hostId: targetHostId, room: ROOM_ID });
+                logMessage(`Sent connection request to host ${targetHostId}.`, setLogs);
+
+            }, [socket, setLogs, cleanupPeerConnection]);
+
+
+            React.useEffect(() => {
+                if (!socket) return;
+
+                const handleOffer = ({ fromId, offer }) => {
+                    if (fromId !== hostSocketId) {
+                        logMessage(`Received offer from unexpected ID ${fromId}, expecting ${hostSocketId}. Ignoring.`, setLogs);
+                        return;
+                    }
+                    if (!peerConnection.current || peerConnection.current.signalingState !== 'stable') {
+                        logMessage(`Peer connection not ready or not stable for offer from ${fromId}. Current state: ${peerConnection.current ? peerConnection.current.signalingState : 'N/A'}. Re-initializing.`, setLogs);
+                        // This indicates a potential race condition or an issue where the PC wasn't set up correctly.
+                        // We need to ensure connectToHost has established a PC.
+                        // For this PoC, we'll proceed assuming connectToHost was called and PC is being set up.
+                        // A more robust solution might queue the offer or ensure PC is 'stable'.
+                        // If peerConnection.current is null, we should definitely call connectToHost.
+                        if (!peerConnection.current) {
+                            connectToHost(fromId); // This will create a new PC
+                            // Defer processing offer or queue it until PC is ready.
+                            // For simplicity, we'll log and hope for the best, but this is a tricky spot.
+                            logMessage("Called connectToHost again due to missing PC on offer. Offer might be processed by new PC.", setLogs);
+                            // It might be better to return here and let the new PC handle a fresh offer sequence.
+                        }
+                    }
+
+                    logMessage(`Received offer from host ${fromId}.`, setLogs);
+                    setConnectionStatus('Offer received, creating answer...');
+                    peerConnection.current.setRemoteDescription(new RTCSessionDescription(offer))
+                        .then(() => {
+                            if (peerConnection.current.signalingState === 'have-remote-offer') {
+                                return peerConnection.current.createAnswer();
+                            } else {
+                                throw new Error(`Cannot create answer in signaling state: ${peerConnection.current.signalingState}`);
+                            }
+                        })
+                        .then(answer => peerConnection.current.setLocalDescription(answer))
+                        .then(() => {
+                            socket.emit('answer', { target: fromId, answer: peerConnection.current.localDescription, room: ROOM_ID });
+                            logMessage(`Answer sent to host ${fromId}.`, setLogs);
+                            setConnectionStatus('Answer sent. Waiting for stream...');
+                        })
+                        .catch(e => {
+                            logMessage(`Error processing offer from ${fromId}: ${e.message}`, setLogs);
+                            setConnectionStatus(`Error: ${e.message}`);
+                            cleanupPeerConnection();
+                        });
+                };
+                socket.on('offer', handleOffer);
+
+                const handleIceCandidate = ({ fromId, candidate }) => {
+                    if (fromId !== hostSocketId) return; 
+                    // logMessage(`Received ICE candidate from host ${fromId}.`, setLogs); // Can be verbose
+                    if (peerConnection.current && candidate && peerConnection.current.signalingState !== "closed") {
+                        peerConnection.current.addIceCandidate(new RTCIceCandidate(candidate))
+                            .catch(e => {
+                                if (peerConnection.current && peerConnection.current.signalingState !== "closed") {
+                                    logMessage(`Error adding ICE candidate from host ${fromId}: ${e.message}`, setLogs);
+                                }
+                            });
+                    }
+                };
+                socket.on('ice-candidate', handleIceCandidate);
+
+                const handleHostStartedStream = (incomingHostId) => {
+                    logMessage(`Host ${incomingHostId} started streaming.`, setLogs);
+                    setIsHostStreaming(true);
+                    setHostSocketId(incomingHostId); // Set the current host
+                    connectToHost(incomingHostId); // Initiate connection
+                };
+                socket.on('host-started-stream', handleHostStartedStream);
+
+                const handleHostStoppedStream = (stoppedHostId) => {
+                    logMessage(`Host ${stoppedHostId} stopped streaming.`, setLogs);
+                    if (hostSocketId === stoppedHostId || hostSocketId === null) { // Check if it's the host we were connected to or expecting
+                        setIsHostStreaming(false);
+                        setRemoteStream(null);
+                        cleanupPeerConnection();
+                        setHostSocketId(null); // Clear host ID
+                        setConnectionStatus('Host stopped streaming.');
+                    } else {
+                        logMessage(`Received host-stopped-stream from ${stoppedHostId}, but current host is ${hostSocketId}. No action.`, setLogs);
+                    }
+                };
+                socket.on('host-stopped-stream', handleHostStoppedStream);
+                
+                // Initial check for active host when joining
+                logMessage('Checking for existing host...', setLogs);
+                socket.emit('check-for-host', ROOM_ID, (activeHostId) => {
+                    if (activeHostId) {
+                        logMessage(`Host ${activeHostId} is already streaming. Connecting...`, setLogs);
+                        setIsHostStreaming(true);
+                        setHostSocketId(activeHostId);
+                        connectToHost(activeHostId);
+                    } else {
+                        logMessage('No host currently streaming in this room.', setLogs);
+                        setIsHostStreaming(false);
+                        setConnectionStatus('Waiting for host to start streaming...');
+                    }
+                });
+
+                return () => {
+                    socket.off('offer', handleOffer);
+                    socket.off('ice-candidate', handleIceCandidate);
+                    socket.off('host-started-stream', handleHostStartedStream);
+                    socket.off('host-stopped-stream', handleHostStoppedStream);
+                    cleanupPeerConnection();
+                    logMessage("Participant page unmounted. Cleaned up.", setLogs);
+                };
+            }, [socket, hostSocketId, setLogs, connectToHost, cleanupPeerConnection]); 
+
+            return (
+                <div className="p-6 bg-gray-800 shadow-xl rounded-lg">
+                    <h2 className="text-3xl font-bold mb-6 text-center text-teal-300">Participant View</h2>
+                    {isHostStreaming && remoteStream ? (
+                        <div>
+                             <h3 className="text-xl font-semibold mb-2 text-gray-300">Host's Stream:</h3>
+                             <VideoPlayer stream={remoteStream} isMuted={false} label="Live Stream from Host" />
+                        </div>
+                    ) : (
+                         <p className="text-center text-yellow-400 p-4 bg-yellow-900 bg-opacity-50 rounded">
+                            <span className={`status-dot ${isHostStreaming && !remoteStream ? 'yellow' : 'red'}`}></span>
+                            {connectionStatus}
+                        </p>
+                    )}
+                </div>
+            );
+        }
+
+        // Main App Component
+        function App() {
+            const [role, setRole] = React.useState(null); // 'host' or 'participant'
+            const [socket, setSocket] = React.useState(null);
+            const [logs, setLogs] = React.useState([]); 
+            const [socketConnected, setSocketConnected] = React.useState(false);
+
+            React.useEffect(() => {
+                // This check ensures 'io' is available before trying to use it.
+                if (typeof io === 'undefined') {
+                    logMessage('Socket.IO client (io) not loaded. Cannot connect.', setLogs);
+                    // Optionally, display an error message to the user in the UI
+                    return;
+                }
+
+                const newSocket = io(SOCKET_SERVER_URL, {
+                    reconnectionAttempts: 3, // Try to reconnect a few times
+                    timeout: 10000, // Connection timeout
+                });
+                setSocket(newSocket);
+                logMessage('Attempting to connect to signaling server...', setLogs);
+
+                newSocket.on('connect', () => {
+                    setSocketConnected(true);
+                    logMessage(`Connected to server with ID: ${newSocket.id}`, setLogs);
+                });
+                
+                newSocket.on('disconnect', (reason) => {
+                    setSocketConnected(false);
+                    logMessage(`Socket disconnected: ${reason}. Will attempt to reconnect if configured.`, setLogs);
+                    if (reason === 'io server disconnect') {
+                        // The server deliberately disconnected the socket
+                        newSocket.connect(); // Optionally try to reconnect
+                    }
+                    // else the client will automatically try to reconnect if not 'io server disconnect'
+                });
+
+                newSocket.on('connect_error', (err) => {
+                  setSocketConnected(false);
+                  logMessage(`Socket connection error: ${err.message} (Type: ${err.type}, Description: ${err.description})`, setLogs);
+                  // Potentially display a more user-friendly error in the UI
+                });
+                
+                // Clean up socket connection when App component unmounts
+                return () => {
+                    if (newSocket) {
+                        logMessage('Socket disconnecting due to App unmount...', setLogs);
+                        newSocket.close();
+                        setSocket(null); // Clear socket state
+                        setSocketConnected(false);
+                    }
+                };
+            }, []); // Empty dependency array ensures this runs only once on mount
+
+            const selectRole = (selectedRole) => {
+                setRole(selectedRole);
+                if (socket && socketConnected) { // Check if socket is connected before emitting
+                    socket.emit('join-room', ROOM_ID, selectedRole); 
+                    logMessage(`Joining room ${ROOM_ID} as ${selectedRole}`, setLogs);
+                } else {
+                    logMessage('Cannot join room: Socket not connected.', setLogs);
+                    // Optionally, show an error to the user
+                }
+            };
+            
+            const goBackToRoleSelection = () => {
+                if (socket && role && socketConnected) {
+                    socket.emit('leave-room', ROOM_ID, role); // Pass role to server for specific cleanup
+                    logMessage(`Left room ${ROOM_ID} as ${role}.`, setLogs);
+                }
+                setRole(null); // Go back to role selection
+                // Child components (HostPage/ParticipantPage) useEffect cleanup should handle stopping streams/closing PCs
+            };
+
+
+            if (typeof io === 'undefined') {
+                 return (
+                    <div className="container mx-auto p-4 text-center">
+                        <h1 className="text-3xl font-bold text-red-500">Error: Socket.IO Client Not Loaded</h1>
+                        <p className="text-gray-300 mt-2">Cannot connect to the live service. Please ensure the signaling server is running and accessible.</p>
+                        <div className="mt-8">
+                            <h3 className="text-lg font-semibold mb-2 text-gray-300">Event Log:</h3>
+                            <div className="log-box">
+                                {logs.map((log, index) => (<p key={index}>{log}</p>))}
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+            
+            if (!socketConnected && !socket) { // Initial state before socket is even created
+                 return <div className="text-center text-xl p-10 text-yellow-400">Initializing connection...</div>;
+            }
+            if (!socketConnected && socket) { // Socket created but not yet connected or connection failed
+                 return (
+                     <div className="container mx-auto p-4 text-center">
+                        <h1 className="text-3xl font-bold text-yellow-400">Connecting to Signaling Server...</h1>
+                        <p className="text-gray-300 mt-2">If this persists, please check the server status and your network connection.</p>
+                        <div className="mt-8">
+                            <h3 className="text-lg font-semibold mb-2 text-gray-300">Event Log:</h3>
+                            <div className="log-box">
+                                {logs.map((log, index) => (<p key={index}>{log}</p>))}
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+
+            return (
+                <div className="container mx-auto p-4">
+                    <header className="text-center mb-8">
+                        <h1 className="text-5xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-blue-400 via-purple-500 to-pink-500">
+                            Live Bidding Stream PoC
+                        </h1>
+                        <p className="text-gray-400 mt-2">Using WebRTC, Node.js, Socket.IO, and React</p>
+                        <p className={`text-sm mt-1 ${socketConnected ? 'text-green-400' : 'text-red-400'}`}>
+                            Socket Status: {socketConnected ? 'Connected' : 'Disconnected'}
+                        </p>
+                    </header>
+
+                    {!role ? (
+                        <div className="flex flex-col sm:flex-row justify-center items-center space-y-4 sm:space-y-0 sm:space-x-6 p-6 bg-gray-800 shadow-xl rounded-lg">
+                            <button onClick={() => selectRole('host')} className="btn btn-primary text-lg w-full sm:w-auto" disabled={!socketConnected}>
+                                I am the Host
+                            </button>
+                            <button onClick={() => selectRole('participant')} className="btn btn-secondary text-lg w-full sm:w-auto" disabled={!socketConnected}>
+                                I am a Participant
+                            </button>
+                        </div>
+                    ) : (
+                        <div>
+                            {role === 'host' && <HostPage socket={socket} setLogs={setLogs} />}
+                            {role === 'participant' && <ParticipantPage socket={socket} setLogs={setLogs} />}
+                             <button
+                                onClick={goBackToRoleSelection}
+                                className="mt-6 w-full btn btn-secondary"
+                            >
+                                Back to Role Selection
+                            </button>
+                        </div>
+                    )}
+                    <div className="mt-8">
+                        <h3 className="text-lg font-semibold mb-2 text-gray-300">Event Log:</h3>
+                        <div className="log-box">
+                            {logs.length === 0 && <p>No events yet...</p>}
+                            {logs.map((log, index) => (
+                                <p key={index}>{log}</p>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // Check if io is defined before rendering.
+        // This is a fallback, the App component also handles this.
+        if (typeof io !== 'undefined') {
+            ReactDOM.render(<App />, document.getElementById('root'));
+        } else {
+            const rootElement = document.getElementById('root');
+            if (rootElement) {
+                rootElement.innerHTML = `
+                    <div style="color: red; text-align: center; padding: 20px; font-family: sans-serif;">
+                        <h1>Critical Error</h1>
+                        <p>Socket.IO client library could not be loaded. The application cannot start.</p>
+                        <p>Please ensure your Node.js server (server.js) is running and accessible at ${SOCKET_SERVER_URL || 'http://localhost:3001'}.</p>
+                    </div>`;
+            }
+            console.error("Socket.IO (io) is not defined. Cannot render React app.");
+        }
+    </script>
+</body>
+</html>
