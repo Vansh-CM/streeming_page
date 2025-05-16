@@ -47,7 +47,7 @@
     <script src="https://unpkg.com/react@17/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@17/umd/react-dom.development.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <script src="http://localhost:3001/socket.io/socket.io.js"></script>
+    <script src="https://streem-5ne3.onrender.com/socket.io/socket.io.js"></script>
 </head>
 <body class="flex items-center justify-center min-h-screen">
     <div id="root" class="w-full max-w-4xl p-4"></div>
@@ -55,7 +55,7 @@
     <script type="text/babel" data-presets="react,env">
         // --- Configuration ---
         // UPDATED TO EXPLICITLY POINT TO NODE SERVER
-        const SOCKET_SERVER_URL = 'http://localhost:3001';
+        const SOCKET_SERVER_URL = 'https://streem-5ne3.onrender.com';
         const ROOM_ID = 'bidding-room';
         const ICE_SERVERS = [
             { urls: 'stun:stun.l.google.com:19302' } // Example STUN server
@@ -661,7 +661,7 @@
                     <div style="color: red; text-align: center; padding: 20px; font-family: sans-serif;">
                         <h1>Critical Error</h1>
                         <p>Socket.IO client library could not be loaded. The application cannot start.</p>
-                        <p>Please ensure your Node.js server (server.js) is running and accessible at ${SOCKET_SERVER_URL || 'http://localhost:3001'}.</p>
+                        <p>Please ensure your Node.js server (server.js) is running and accessible at ${SOCKET_SERVER_URL || 'https://streem-5ne3.onrender.com'}.</p>
                     </div>`;
             }
             console.error("Socket.IO (io) is not defined. Cannot render React app.");
